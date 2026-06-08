@@ -12,6 +12,7 @@ using browser automation and scheduling capabilities.
 
 import asyncio
 import json
+import os
 import signal
 from contextlib import suppress
 from datetime import datetime
@@ -37,6 +38,13 @@ init_log(
 
 # Default timezone for scheduling operations
 TIMEZONE = timezone("Asia/Shanghai")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 @logger.catch(reraise=True)
@@ -92,7 +100,7 @@ async def deploy():
     This function runs the collection process immediately and optionally
     sets up a scheduled task for automatic recurring execution.
     """
-    headless = True
+    headless = _env_bool("HEADLESS", True)
 
     # Log current configuration for debugging
     sj = settings.model_dump(mode="json")

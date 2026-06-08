@@ -602,3 +602,77 @@
   - `Continue` 点击兜底新增面向 dialog/modal/overlay 容器的浏览器端扫描：优先点击容器内最后一个可见的 `Continue` 按钮，抓不到时再退化成容器内最后一个可见按钮。
   - `_click_purchase_button()` 在所有点击策略都无进展后，会先做一次强复查并再次尝试清理设备弹窗，再决定是否落成 `click_no_effect`。
   - `_log_purchase_button_context()` 改成短超时采样和受控降级，不再让调试信息读取本身触发 30 秒硬超时。
+
+### 2026-06-08 登录后 MFA 推荐页、启动后端与 GLM 拖拽格式加固
+
+- 现象：
+  - 社区反馈中登录验证码已经通过，但登录后页面可能停在 `/id/login/mfa/add/default`，后续领取阶段最终报 `Failed to confirm claim flow for promotions`。
+  - 本地真实运行时，`browserforge` 的 `fingerprint-network.zip` 下载中断会让 `browser_context` 在 import 阶段直接失败，导致 `BROWSER_BACKEND=playwright` 也无法绕过 Camoufox 初始化问题。
+  - Camoufox 本地真实运行中还出现过 `NS_ERROR_UNKNOWN_HOST` 这类浏览器内 DNS 导航错误，旧领取页入口只重试 Playwright timeout。
+  - 本地真实运行还发现 GLM 可能返回 `source_coordinates` / `target_coordinates` 拖拽坐标，旧归一化逻辑会让 `ImageDragDropChallenge` 缺少 `paths`。
+- 根因判断：
+  - `/id/login/mfa/add/default` 是 Epic 登录后的 MFA 设置推荐中间页，不等同于领取失败；代码此前只显式处理隐私政策页和强制 2FA 错误，没有统一识别和跳过 MFA 推荐页。
+  - Camoufox、`browserforge` 的重型依赖在模块加载时导入，削弱了 `auto` / `playwright` fallback 的意义。
+  - GLM 兼容层的拖拽坐标别名覆盖还不完整。
+- 改动文件：
+  - `app/services/browser_context.py`
+  - `app/services/epic_authorization_service.py`
+  - `app/services/epic_games_service.py`
+  - `app/extensions/llm_adapter.py`
+  - `tests/test_glm_adapter.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - Camoufox 和 `browserforge.fingerprints.Screen` 改为按后端懒加载，避免 Playwright fallback 被 Camoufox 指纹数据下载失败提前拖死。
+  - 周免页登录态入口的导航重试同时覆盖 Playwright timeout 和通用导航错误，降低临时 DNS / 网络错误直接终止运行的概率。
+  - 认证流程新增 `/id/login/mfa/add` 检测与跳过逻辑；若无法自动跳过，会明确提示用户手动跳过或完成 MFA 推荐页，不再把它收口成模糊领取失败。
+  - 领取页登录态检查也会识别 MFA 推荐页，避免新开页面被重定向后继续进入商品领取逻辑。
+  - GLM 拖拽归一化新增 `source_coordinates` / `target_coordinates` 别名，并追加回归测试。
+  - 本地验证：`py_compile` 通过；`PYTHONPATH=app pytest tests/test_glm_adapter.py -q` 通过。真实本地领取未能跑到领取阶段：Playwright 后端连续触发 hCaptcha 失败；Camoufox 已能安装并启动，但本机 Camoufox 内访问 Epic 出现 `NS_ERROR_UNKNOWN_HOST`。
+
+### 2026-06-09 Epic 新结账页 Add to Library 与 GLM 结账验证码修复
+
+- 现象：
+  - 本地真实运行中，登录和初始 `Get` 点击已经正常，但商品页点击后最终报 `Failed to confirm claim flow for promotions`。
+  - 调试快照显示点击后实际已经打开 Epic 结账 iframe，文案为 `THIS IS FREE` / `ADD TO LIBRARY`，旧逻辑只识别 `PLACE ORDER`，因此误判为点击无效。
+  - 结账 hCaptcha 中，GLM 会返回 `image_label_single_select`、裸 `x,y` 点坐标、`source_coordinates` / `target_coordinates` 或局部/网格坐标混用，旧兼容层会触发 schema 校验失败或坐标偏移。
+  - 结账验证码通过后，Epic 会重建 checkout DOM，旧 `_submit_place_order()` 继续使用失效的按钮 locator，导致后续点击策略各自等待到超时。
+- 根因判断：
+  - Epic 免费领取页已从旧 `PLACE ORDER` 流程变成部分商品使用 `ADD TO LIBRARY` 的即时结账流程，状态机的 checkout marker 和提交按钮候选不完整。
+  - GLM OpenAI 兼容响应格式比 Gemini 更松散，需要对当前 hCaptcha 的路由枚举、裸坐标和图片坐标提示做额外归一化。
+  - 结账验证码通过后 checkout iframe/按钮可能被替换，提交阶段必须重新扫描当前按钮，不能复用验证码前的 locator。
+  - 机械拖拽轨迹会降低 drag 类结账验证码通过率，应默认使用 Bezier 轨迹。
+- 改动文件：
+  - `app/services/epic_games_service.py`
+  - `app/extensions/llm_adapter.py`
+  - `app/deploy.py`
+  - `app/settings.py`
+  - `docker/docker-compose.yaml`
+  - `docker/.env`
+  - `tests/test_glm_adapter.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - checkout 识别新增 `ADD TO LIBRARY` / `THIS IS FREE` / `ADD IT TO YOUR LIBRARY` marker，并把 `ADD TO LIBRARY` 当作可提交按钮。
+  - 结账验证码识别新增 `PLEASE TRY AGAIN` + `VERIFY` 组合，避免验证码 iframe 被误判为普通 checkout。
+  - `_submit_place_order()` 每个点击策略前都会重新扫描当前 checkout 按钮，并给 dispatch/dom 点击加短超时，避免 DOM 重建后卡住旧 locator。
+  - GLM 图片请求改为标准 data URL；图片坐标任务追加网格坐标提示；兼容 `image_label_single_select`、当前 hCaptcha `image_drag_multi` 枚举、裸 `x,y` 点坐标和更多拖拽坐标别名。
+  - `HEADLESS=false` 可用于本地可视化排查；默认和 Docker 配置改为启用 Bezier 轨迹。
+  - 本地验证：`py_compile` 通过；`PYTHONPATH=app pytest tests/test_glm_adapter.py -q` 通过，7 个用例通过。
+  - 真实本地领取验证成功：`Rogue Waters` 已显示 `In Library`；`Songs of Conquest` 通过结账 hCaptcha 后确认 `IN LIBRARY`；最终日志为 `Browser tasks execution finished successfully` / `Scheduler is disabled, deployment completed`。
+
+### 2026-06-09 GitHub Actions 同入口完整领取收口复测
+
+- 现象：
+  - 需要确认修复不只是本地已登录账号成功，还要覆盖 GitHub Actions 使用的 `uv run app/deploy.py` 主入口完整收口。
+  - 第二个 Epic 账号首次运行会经历完整登录、登录 hCaptcha、MFA 推荐页跳过、商店稳态验证、两个商品即时结账和结账 hCaptcha。
+- 根因判断：
+  - GitHub Actions 与本地测试共用 `app/deploy.py` 入口；如果 Actions 没有显式传入 Bezier 轨迹配置，虽然代码默认已修正，日志和 fork 配置仍不够直观。
+  - 完整收口必须覆盖“验证码后无可解 frame 但稍后出现 `IN LIBRARY`”和“验证码后按钮被 overlay 拦截但 force 点击继续推进”两条路径。
+- 改动文件：
+  - `.github/workflows/epic-gamer.yml`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - GitHub Actions 入口显式设置 `DISABLE_BEZIER_TRAJECTORY=false`，与本地成功配置一致。
+  - 使用 `ronchy2000@gmail.com` 账号按 Actions 同入口配置真实复测成功：登录 hCaptcha 通过，MFA 推荐页自动跳过，`Epic store session verification success` 后进入领取。
+  - `Rogue Waters` 通过 `ADD TO LIBRARY` 即时结账后确认 `IN LIBRARY`。
+  - `Songs of Conquest` 结账 hCaptcha 首轮失败后重试成功，验证码后标准点击被 overlay 拦截，但 force 点击推进并最终确认 `IN LIBRARY`。
+  - 最终日志为 `Confirmed 2 instant claim(s)`、`Browser tasks execution finished successfully`、`Scheduler is disabled, deployment completed`，进程退出码为 0。

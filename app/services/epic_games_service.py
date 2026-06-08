@@ -14,6 +14,7 @@ from typing import List
 import httpx
 from hcaptcha_challenger.agent import AgentV
 from loguru import logger
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Frame, Page
 from playwright.async_api import expect, TimeoutError, FrameLocator
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -38,6 +39,7 @@ URL_PRODUCT_BUNDLES = "https://store.epicgames.com/en-US/bundles/"
 PURCHASE_IFRAME_SELECTOR = (
     "//iframe[contains(@id, 'webPurchaseContainer') or contains(@src, 'purchase')]"
 )
+CHECKOUT_BUTTON_TEXTS = ("PLACE ORDER", "ADD TO LIBRARY")
 PurchaseContainer = FrameLocator | Frame | Page
 
 
@@ -120,6 +122,9 @@ class EpicAgent:
     def _needs_privacy_policy_correction(self) -> bool:
         return "/id/login/correction/privacy-policy" in self.page.url
 
+    def _needs_mfa_setup_prompt(self) -> bool:
+        return "/id/login/mfa/add" in self.page.url
+
     @staticmethod
     def _privacy_policy_confirmation_message(current_url: str) -> str:
         return (
@@ -128,8 +133,16 @@ class EpicAgent:
             f"and rerun the workflow. current_url={current_url}"
         )
 
+    @staticmethod
+    def _mfa_setup_prompt_message(current_url: str) -> str:
+        return (
+            "Epic account is showing the MFA setup prompt after login. "
+            "Please sign in once in a normal browser, skip or finish that prompt, "
+            f"and rerun the workflow. current_url={current_url}"
+        )
+
     async def _get_login_status(self, timeout_ms: int = 30000) -> str | None:
-        if self._needs_privacy_policy_correction():
+        if self._needs_privacy_policy_correction() or self._needs_mfa_setup_prompt():
             return None
 
         try:
@@ -152,16 +165,50 @@ class EpicAgent:
                     self._privacy_policy_confirmation_message(self.page.url)
                 )
 
+            if self._needs_mfa_setup_prompt():
+                raise EpicManualActionRequiredError(self._mfa_setup_prompt_message(self.page.url))
+
             status = await self._get_login_status(timeout_ms=1500)
             if status in {"true", "false"}:
                 return status
 
             await self.page.wait_for_timeout(500)
 
+        if self._needs_mfa_setup_prompt():
+            raise EpicManualActionRequiredError(self._mfa_setup_prompt_message(self.page.url))
+
         raise RuntimeError(
             "Could not determine Epic login state because //egs-navigation did not appear. "
             f"current_url={self.page.url}"
         )
+
+    async def _goto_claim_page(self, attempts: int = 3) -> None:
+        for attempt in range(1, attempts + 1):
+            try:
+                await self.page.goto(URL_CLAIM, wait_until="domcontentloaded", timeout=45000)
+                return
+            except (PlaywrightTimeoutError, PlaywrightError) as err:
+                logger.warning(
+                    "Claim page navigation timed out during collection ({}/{}) | current_url='{}' err={}",
+                    attempt,
+                    attempts,
+                    self.page.url,
+                    err,
+                )
+                with suppress(Exception):
+                    await self.page.evaluate("window.stop()")
+
+                if "store.epicgames.com" in self.page.url and "free-games" in self.page.url:
+                    logger.warning(
+                        "Continuing with partially loaded claim page during collection | current_url='{}'",
+                        self.page.url,
+                    )
+                    return
+
+                if attempt < attempts:
+                    await self.page.wait_for_timeout(2000 * attempt)
+
+        raise PlaywrightTimeoutError("Timed out navigating to Epic claim page")
 
     async def _sync_order_history(self):
         if self._orders:
@@ -197,7 +244,7 @@ class EpicAgent:
 
     async def _should_ignore_task(self) -> bool:
         self._ctx_cookies_is_available = False
-        await self.page.goto(URL_CLAIM, wait_until="domcontentloaded")
+        await self._goto_claim_page()
 
         if self._needs_privacy_policy_correction():
             raise EpicManualActionRequiredError(
@@ -488,10 +535,7 @@ class EpicGames:
         except Exception:
             return False
 
-        markers = (
-            "DEVICE NOT SUPPORTED",
-            "NOT COMPATIBLE WITH YOUR CURRENT DEVICE",
-        )
+        markers = ("DEVICE NOT SUPPORTED", "NOT COMPATIBLE WITH YOUR CURRENT DEVICE")
         return any(marker in combined_text for marker in markers)
 
     @staticmethod
@@ -674,6 +718,9 @@ class EpicGames:
 
         checkout_markers = (
             ("CHECKOUT", "PLACE ORDER"),
+            ("CHECKOUT", "ADD TO LIBRARY"),
+            ("THIS IS FREE", "ADD TO LIBRARY"),
+            ("ADD IT TO YOUR LIBRARY", "ADD TO LIBRARY"),
             ("REVIEW AND PLACE ORDER", "ORDER SUMMARY"),
             ("VERIFY YOUR INFORMATION", "ORDER SUMMARY"),
         )
@@ -732,7 +779,9 @@ class EpicGames:
                 "Purchase button {} click returned without visible progress - {}", name, url
             )
 
-        if await EpicGames._device_not_supported_marker_present(page, timeout=1500, frame_timeout=800):
+        if await EpicGames._device_not_supported_marker_present(
+            page, timeout=1500, frame_timeout=800
+        ):
             logger.warning(
                 "Purchase button click made no progress because device modal is still blocking - {}",
                 url,
@@ -855,16 +904,17 @@ class EpicGames:
         logger.debug("Scanning for purchase iframe...")
         wpc = page.frame_locator(PURCHASE_IFRAME_SELECTOR).first
 
-        logger.debug("Looking for 'PLACE ORDER' button...")
-        place_order_btn = wpc.locator("button", has_text="PLACE ORDER")
+        logger.debug("Looking for checkout submit button...")
         confirm_btn = wpc.locator("//button[contains(@class, 'payment-confirm__btn')]")
 
-        try:
-            await expect(place_order_btn).to_be_visible(timeout=place_order_timeout)
-            logger.debug("✅ Found 'PLACE ORDER' button via text match")
-            return wpc, place_order_btn
-        except AssertionError:
-            pass
+        for button_text in CHECKOUT_BUTTON_TEXTS:
+            checkout_btn = wpc.locator("button", has_text=button_text)
+            try:
+                await expect(checkout_btn).to_be_visible(timeout=place_order_timeout)
+                logger.debug("✅ Found '{}' button via text match", button_text)
+                return wpc, checkout_btn
+            except AssertionError:
+                pass
 
         try:
             await expect(confirm_btn).to_be_visible(timeout=confirm_timeout)
@@ -884,17 +934,20 @@ class EpicGames:
                 if not EpicGames._looks_like_checkout_frame(body_text):
                     continue
 
-                place_order_btn = container.locator("button", has_text="PLACE ORDER")
                 confirm_btn = container.locator(
                     "//button[contains(@class, 'payment-confirm__btn')]"
                 )
 
-                try:
-                    await expect(place_order_btn).to_be_visible(timeout=place_order_timeout)
-                    logger.debug("✅ Found 'PLACE ORDER' button by scanning checkout containers")
-                    return container, place_order_btn
-                except AssertionError:
-                    pass
+                for button_text in CHECKOUT_BUTTON_TEXTS:
+                    checkout_btn = container.locator("button", has_text=button_text)
+                    try:
+                        await expect(checkout_btn).to_be_visible(timeout=place_order_timeout)
+                        logger.debug(
+                            "✅ Found '{}' button by scanning checkout containers", button_text
+                        )
+                        return container, checkout_btn
+                    except AssertionError:
+                        pass
 
                 try:
                     await expect(confirm_btn).to_be_visible(timeout=confirm_timeout)
@@ -904,7 +957,7 @@ class EpicGames:
                     pass
 
         logger.warning("Primary buttons not found in checkout containers.")
-        raise AssertionError("Could not find Place Order button in checkout containers")
+        raise AssertionError("Could not find checkout submit button in checkout containers")
 
     @staticmethod
     async def _uk_confirm_order(wpc: PurchaseContainer):
@@ -1017,6 +1070,7 @@ class EpicGames:
             "VERIFY YOU ARE HUMAN",
         ]
         purchase_frame_markers = [*page_markers, "I AM HUMAN", "SKIP"]
+        purchase_frame_marker_pairs = [("PLEASE TRY AGAIN", "VERIFY")]
 
         visible_locators = [
             page.get_by_text("One more step", exact=False),
@@ -1040,7 +1094,10 @@ class EpicGames:
             return True
 
         purchase_frame_text = await EpicGames._purchase_frame_text(page)
-        return any(marker in purchase_frame_text for marker in purchase_frame_markers)
+        return any(marker in purchase_frame_text for marker in purchase_frame_markers) or any(
+            all(marker in purchase_frame_text for marker in markers)
+            for markers in purchase_frame_marker_pairs
+        )
 
     async def _resolve_checkout_security_check(
         self, page: Page, agent: AgentV, url: str, max_wait_ms: int = 600000
@@ -1255,17 +1312,27 @@ class EpicGames:
         with suppress(Exception):
             await payment_btn.scroll_into_view_if_needed(timeout=2000)
 
+        async def current_payment_button():
+            with suppress(Exception):
+                _wpc, refreshed_btn = await self._active_purchase_container(
+                    self.page, place_order_timeout=1000, confirm_timeout=500
+                )
+                return refreshed_btn
+            return payment_btn
+
         click_attempts = (
-            ("standard", lambda: payment_btn.click(timeout=5000)),
-            ("force", lambda: payment_btn.click(force=True, timeout=5000)),
-            ("dispatch", lambda: payment_btn.dispatch_event("click")),
-            ("dom", lambda: payment_btn.evaluate("(button) => button.click()")),
-            ("keyboard", lambda: payment_btn.press("Enter", timeout=2000)),
+            ("standard", lambda btn: btn.click(timeout=5000)),
+            ("force", lambda btn: btn.click(force=True, timeout=5000)),
+            ("dispatch", lambda btn: btn.dispatch_event("click", timeout=5000)),
+            ("dom", lambda btn: btn.evaluate("(button) => button.click()", timeout=5000)),
+            ("keyboard", lambda btn: btn.press("Enter", timeout=2000)),
         )
 
         for name, action in click_attempts:
+            active_btn = await current_payment_button()
+
             try:
-                await action()
+                await action(active_btn)
             except TimeoutError as err:
                 logger.warning(f"Place Order {name} click timed out. {url=} err={err}")
                 continue
@@ -1274,7 +1341,7 @@ class EpicGames:
                 continue
 
             await self.page.wait_for_timeout(1500)
-            if not await self._is_locator_visible(payment_btn, timeout=750):
+            if not await self._is_locator_visible(active_btn, timeout=750):
                 logger.debug(f"Place Order button disappeared after {name} click. {url=}")
                 return
 
@@ -1282,7 +1349,7 @@ class EpicGames:
                 "Place Order state after {} click: {} | {}",
                 name,
                 url,
-                await self._payment_button_state(payment_btn),
+                await self._payment_button_state(active_btn),
             )
             return
 
