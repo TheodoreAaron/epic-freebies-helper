@@ -695,3 +695,23 @@
   - 浏览器关闭职责统一收回 `open_browser_context()`，移除了 `execute_browser_tasks()` 内部的重复 `browser.close()`。
   - Camoufox 分支改为手动托管 `__aenter__` / `__aexit__`，并在退出时抑制关闭阶段异常，避免驱动已断开时把 run 改写成失败。
   - 这样即使浏览器进程先一步结束，GitHub Actions 也不会因为清理阶段双重关闭而额外翻成 exit code 1。
+
+### 2026-06-16 Epic Store 导航组件缺失导致 Actions 登录态误判
+
+- 现象：
+  - 多个用户的 GitHub Actions 日志显示登录 hCaptcha、MFA 推荐页跳过、账号校验和商店会话验证已经完成。
+  - 进入领取前检查时，页面停在 `https://store.epicgames.com/free-games?lang=en-US`，但 `//egs-navigation` 长时间没有出现，最终报 `Could not determine Epic login state because //egs-navigation did not appear`。
+  - 另一些日志在认证后的商店稳态检查阶段反复输出 `Timed out while waiting for //egs-navigation during auth check`，说明同一依赖点在 Actions 环境下不稳定。
+- 根因判断：
+  - Epic Store 的导航 Web Component 在 GitHub Actions / Camoufox 环境中可能延迟、失败或被部分加载卡住。
+  - 旧逻辑把 `egs-navigation[isloggedin]` 作为唯一登录态来源；即使账号接口已经可访问，也会因为前端导航壳层缺失而终止任务。
+  - 这不是 `Device not supported` 或 `ADD TO LIBRARY` 结账状态机回退，而是领取前的会话探针过窄。
+- 改动文件：
+  - `app/services/epic_authorization_service.py`
+  - `app/services/epic_games_service.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 认证后的商店稳态检查和领取前登录态检查保留 `egs-navigation` 快路径。
+  - 如果 8 秒内仍拿不到导航登录态，会访问 Epic 账号订单接口 `ajaxGetOrderHistory` 做后备会话探针。
+  - 只有后备接口返回合法 JSON 且包含 `orders` 列表时才视为已登录；未登录、重定向、页面错误或非 JSON 响应仍会继续失败，不会把匿名页面误判成有效会话。
+  - 领取前订单同步复用同一订单接口解析逻辑，并保留已有 `Device not supported`、`ADD TO LIBRARY`、结账 hCaptcha 和订单历史最终确认逻辑。

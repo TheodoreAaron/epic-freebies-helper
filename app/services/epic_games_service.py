@@ -36,6 +36,7 @@ URL_CART_SUCCESS = "https://store.epicgames.com/en-US/cart/success"
 URL_PROMOTIONS = "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions"
 URL_PRODUCT_PAGE = "https://store.epicgames.com/en-US/p/"
 URL_PRODUCT_BUNDLES = "https://store.epicgames.com/en-US/bundles/"
+URL_ORDER_HISTORY = "https://www.epicgames.com/account/v2/payment/ajaxGetOrderHistory"
 PURCHASE_IFRAME_SELECTOR = (
     "//iframe[contains(@id, 'webPurchaseContainer') or contains(@src, 'purchase')]"
 )
@@ -158,6 +159,8 @@ class EpicAgent:
 
     async def _wait_for_claim_page_login_state(self, timeout_seconds: int = 45) -> str:
         deadline = time.monotonic() + timeout_seconds
+        account_probe_at = time.monotonic() + 8
+        account_probe_attempted = False
 
         while time.monotonic() < deadline:
             if self._needs_privacy_policy_correction():
@@ -172,10 +175,22 @@ class EpicAgent:
             if status in {"true", "false"}:
                 return status
 
+            if not account_probe_attempted and time.monotonic() >= account_probe_at:
+                account_probe_attempted = True
+                logger.warning(
+                    "Epic navigation login marker did not appear; probing account session via order history."
+                )
+                if await self._has_account_session():
+                    return "true"
+                await self._goto_claim_page()
+
             await self.page.wait_for_timeout(500)
 
         if self._needs_mfa_setup_prompt():
             raise EpicManualActionRequiredError(self._mfa_setup_prompt_message(self.page.url))
+
+        if await self._has_account_session():
+            return "true"
 
         raise RuntimeError(
             "Could not determine Epic login state because //egs-navigation did not appear. "
@@ -210,14 +225,39 @@ class EpicAgent:
 
         raise PlaywrightTimeoutError("Timed out navigating to Epic claim page")
 
-    async def _sync_order_history(self):
-        if self._orders:
-            return
-        completed_orders: List[OrderItem] = []
+    async def _load_order_history_payload(self) -> dict | None:
         try:
-            await self.page.goto("https://www.epicgames.com/account/v2/payment/ajaxGetOrderHistory")
-            text_content = await self.page.text_content("//pre")
-            data = json.loads(text_content)
+            await self.page.goto(URL_ORDER_HISTORY, wait_until="domcontentloaded", timeout=15000)
+            text_content = ""
+            with suppress(Exception):
+                text_content = await self.page.text_content("//pre", timeout=5000) or ""
+            if not text_content:
+                text_content = await self.page.locator("body").inner_text(timeout=5000)
+            data = json.loads(text_content or "{}")
+            if not isinstance(data.get("orders"), list):
+                raise RuntimeError("Epic order history payload did not contain an orders list")
+            return data
+        except Exception as err:
+            logger.warning("Failed to load Epic order history session probe: {!r}", err)
+            return None
+
+    async def _has_account_session(self) -> bool:
+        payload = await self._load_order_history_payload()
+        if payload is None:
+            return False
+        logger.success("Epic account session verified via order history endpoint")
+        return True
+
+    async def _sync_order_history(self) -> bool:
+        if self._orders:
+            return True
+        completed_orders: List[OrderItem] = []
+        data = await self._load_order_history_payload()
+        if data is None:
+            self._orders = completed_orders
+            return False
+
+        try:
             for _order in data["orders"]:
                 order = Order(**_order)
                 if order.orderType != "PURCHASE":
@@ -229,6 +269,7 @@ class EpicAgent:
         except Exception as err:
             logger.warning(err)
         self._orders = completed_orders
+        return True
 
     async def _check_orders(self):
         await self._sync_order_history()
@@ -1223,11 +1264,7 @@ class EpicGames:
 
     async def _is_promotion_in_order_history(self, promotion: PromotionGame) -> bool:
         try:
-            await self.page.goto(
-                "https://www.epicgames.com/account/v2/payment/ajaxGetOrderHistory",
-                wait_until="domcontentloaded",
-                timeout=15000,
-            )
+            await self.page.goto(URL_ORDER_HISTORY, wait_until="domcontentloaded", timeout=15000)
             text_content = await self.page.text_content("//pre")
             payload = json.loads(text_content or "{}")
         except Exception as err:

@@ -22,6 +22,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from settings import SCREENSHOTS_DIR, settings
 
 URL_CLAIM = "https://store.epicgames.com/en-US/free-games"
+URL_ORDER_HISTORY = "https://www.epicgames.com/account/v2/payment/ajaxGetOrderHistory"
 
 
 class EpicAuthenticationFatalError(RuntimeError):
@@ -398,8 +399,27 @@ class EpicAuthorization:
             )
             return None
 
+    async def _has_account_session(self) -> bool:
+        try:
+            await self.page.goto(URL_ORDER_HISTORY, wait_until="domcontentloaded", timeout=15000)
+            text_content = ""
+            with suppress(Exception):
+                text_content = await self.page.text_content("//pre", timeout=5000) or ""
+            if not text_content:
+                text_content = await self.page.locator("body").inner_text(timeout=5000)
+            data = json.loads(text_content or "{}")
+            if not isinstance(data.get("orders"), list):
+                raise RuntimeError("Epic order history payload did not contain an orders list")
+            logger.success("Epic account session verified via order history endpoint")
+            return True
+        except Exception as err:
+            logger.warning("Failed to verify Epic account session via order history: {!r}", err)
+            return False
+
     async def _ensure_store_session_ready(self, timeout_seconds: int = 45) -> None:
         deadline = time.monotonic() + timeout_seconds
+        account_probe_at = time.monotonic() + 8
+        account_probe_attempted = False
 
         while time.monotonic() < deadline:
             if self._needs_privacy_policy_correction():
@@ -424,10 +444,23 @@ class EpicAuthorization:
                     f"current_url={self.page.url}"
                 )
 
+            if not account_probe_attempted and time.monotonic() >= account_probe_at:
+                account_probe_attempted = True
+                logger.warning(
+                    "Epic navigation login marker did not appear after authentication; "
+                    "probing account session via order history."
+                )
+                if await self._has_account_session():
+                    return
+                await self._goto_claim_page()
+
             await self.page.wait_for_timeout(500)
 
         if self._needs_mfa_setup_prompt():
             raise EpicManualActionRequiredError(self._mfa_setup_prompt_message(self.page.url))
+
+        if await self._has_account_session():
+            return
 
         raise RuntimeError(
             "Could not verify Epic store access after authentication. "
