@@ -251,6 +251,23 @@
   - 将“为什么默认按周跑”“如何自己改 cron”写入中英文 GitHub Actions 文档。
   - 在中英文 README 的功能概览中同步说明默认是每周四运行一次，并支持自行调整。
 
+### Checkout 安全校验解完后仍停在 Add to library，最终被误判失败
+
+- 现象：
+  - 某些免费游戏在 checkout 中完成一轮或多轮 hCaptcha 后，并不会立刻跳到“Thanks for your order / In Library”这类明确成功态。
+  - 页面可能仍停留在商品页上的 checkout 弹层，继续显示 `Add to library`，最后主流程以 `Instant checkout ended without a confirmed claim state` 收尾，并在最终 reconciliation 后抛出失败。
+- 根因判断：
+  - 旧的最终确认逻辑对这类“checkout 还活着，但尚未被动变成 claimed state”的情况过于保守。
+  - `final reconciliation` 主要做页面状态检查和订单历史检查，没有在发现 checkout/security 仍然存在时主动把领取流程接着跑完。
+  - 同时 reconciliation 首轮不强制重开商品页，容易继续沿用已经过期的 checkout 弹层 DOM。
+- 改动文件：
+  - `app/services/epic_games_service.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - `final reconciliation` 现在每轮都会重开商品页，并在发现 `checkout` 或 `security` 仍然活跃时，主动恢复即时结账流程，而不是只做被动确认。
+  - `_handle_instant_checkout()` 增加内部恢复模式，允许 reconciliation 复用即时结账逻辑，但避免递归触发自己的 finalize 分支。
+  - 将 unconfirmed checkout 的最终确认次数和等待窗口拉长，提升 Epic 后端状态回写较慢时的恢复能力。
+
 ### Device not supported 弹窗再次导致领取失败
 
 - 现象：

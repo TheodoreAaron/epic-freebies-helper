@@ -1299,16 +1299,16 @@ class EpicGames:
         page: Page,
         promotion: PromotionGame,
         *,
-        attempts: int = 3,
+        attempts: int = 4,
         revisit_product_page: bool = True,
     ) -> bool:
         url = promotion.url
 
         for attempt in range(1, attempts + 1):
-            if revisit_product_page and url.rstrip("/") not in page.url.rstrip("/"):
+            if revisit_product_page:
                 try:
                     await page.goto(url, wait_until="load", timeout=15000)
-                    await page.wait_for_timeout(1500)
+                    await page.wait_for_timeout(1500 * attempt)
                 except Exception as revisit_err:
                     logger.warning(
                         "Promotion reconciliation could not reopen target page (attempt {}) - "
@@ -1320,6 +1320,27 @@ class EpicGames:
                     )
 
             await self._handle_device_not_supported_modal(page, url, timeout_ms=5000)
+
+            state, _payload = await self._wait_for_purchase_state(page, url, timeout_ms=12000)
+            if state in {"checkout", "security"}:
+                logger.warning(
+                    "Promotion reconciliation found the checkout flow still active "
+                    "(attempt {}) - title='{}' state='{}' url='{}'",
+                    attempt,
+                    promotion.title,
+                    state,
+                    url,
+                )
+                if await self._handle_instant_checkout(page, promotion, allow_finalize=False):
+                    logger.success(
+                        "🎉 Promotion recovered by resuming checkout during reconciliation "
+                        "(attempt {}) - title='{}' url='{}'",
+                        attempt,
+                        promotion.title,
+                        url,
+                    )
+                    return True
+
             if await self._is_claimed_state(page, url):
                 logger.success(
                     "🎉 Promotion confirmed from product page during reconciliation "
@@ -1340,27 +1361,13 @@ class EpicGames:
                 )
                 return True
 
-            if not revisit_product_page or attempt >= attempts:
-                continue
-
-            try:
-                await page.goto(url, wait_until="load", timeout=15000)
-                await page.wait_for_timeout(2000 * attempt)
-            except Exception as reload_err:
-                logger.warning(
-                    "Promotion reconciliation revisit failed (attempt {}) - title='{}' url='{}' err={!r}",
-                    attempt,
-                    promotion.title,
-                    url,
-                    reload_err,
-                )
-                await self._capture_purchase_debug(page, "instant_checkout_final_reload_failed", url)
-                break
+            if attempt < attempts:
+                await page.wait_for_timeout(2500 * attempt)
 
         return False
 
     async def _finalize_unconfirmed_checkout(self, page: Page, promotion: PromotionGame) -> bool:
-        return await self._confirm_promotion_claimed(page, promotion, attempts=2)
+        return await self._confirm_promotion_claimed(page, promotion, attempts=4)
 
     @staticmethod
     async def _payment_button_state(payment_btn) -> str:
@@ -1483,7 +1490,9 @@ class EpicGames:
 
         return "checkout"
 
-    async def _handle_instant_checkout(self, page: Page, promotion: PromotionGame) -> bool:
+    async def _handle_instant_checkout(
+        self, page: Page, promotion: PromotionGame, *, allow_finalize: bool = True
+    ) -> bool:
         url = promotion.url
         logger.info("🚀 Triggering Instant Checkout Flow...")
         agent = AgentV(page=page, agent_config=settings)
@@ -1589,6 +1598,8 @@ class EpicGames:
 
             logger.warning(f"Instant checkout ended without a confirmed claim state - {url=}")
             await self._capture_purchase_debug(page, "instant_checkout_unconfirmed", url)
+            if not allow_finalize:
+                return False
             return await self._finalize_unconfirmed_checkout(page, promotion)
 
         except Exception as err:
@@ -1601,6 +1612,8 @@ class EpicGames:
                 logger.success(f"🎉 Instant checkout recovered into claimed state - {url=}")
                 return True
 
+            if not allow_finalize:
+                return False
             return await self._finalize_unconfirmed_checkout(page, promotion)
 
     async def add_promotion_to_cart(
