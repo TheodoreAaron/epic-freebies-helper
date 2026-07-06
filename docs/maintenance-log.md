@@ -715,3 +715,22 @@
   - 如果 8 秒内仍拿不到导航登录态，会访问 Epic 账号订单接口 `ajaxGetOrderHistory` 做后备会话探针。
   - 只有后备接口返回合法 JSON 且包含 `orders` 列表时才视为已登录；未登录、重定向、页面错误或非 JSON 响应仍会继续失败，不会把匿名页面误判成有效会话。
   - 领取前订单同步复用同一订单接口解析逻辑，并保留已有 `Device not supported`、`ADD TO LIBRARY`、结账 hCaptcha 和订单历史最终确认逻辑。
+
+### 2026-07-06 收紧即时结账确认链并修复多游戏连续领取的第二单易失败问题
+
+- 现象：
+  - 有些账号实际已经把周免领进库里，GitHub Actions 最终却仍以 `Failed to confirm claim flow for promotions` 退出。
+  - 另一类高频反馈是：同一轮两个周免里，第一个能成功，第二个更容易卡在 checkout 安全校验、`Place Order` / `Add to library` 后无收口，最终误报失败。
+- 根因判断：
+  - 旧的即时结账收尾只做了偏短的一次性确认，遇到 Epic 商品页状态回写或订单历史同步稍慢时，容易把“已完成但未及时显现”的 case 判成失败。
+  - `Place Order` / `Add to library` 的提交逻辑在第一次 click 调用不抛异常时就直接返回，即使按钮、overlay 和页面状态完全没变化，也不会继续尝试后续提交策略。
+  - 连续领取多个游戏时，第二个商品更容易遇到更重的 checkout 风控；同时旧逻辑固定偏向首个 purchase iframe，遇到遗留或非活动 iframe 时更容易点到错误容器。
+- 改动文件：
+  - `app/services/epic_games_service.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - checkout 容器扫描改为优先遍历当前页面上更像活动 checkout 的 frame / page 容器，不再固定依赖首个 purchase iframe。
+  - `Place Order` / `Add to library` 提交改为只有在按钮消失、进入 claimed、安全校验出现或按钮/overlay 状态发生变化时才算本次 click 真正生效；否则继续尝试后续提交策略。
+  - 即时结账末尾增加 promotion 级 reconciliation：可回到商品页重新确认，并额外轮询订单历史，降低“实际已领到但最后没收好”的误报率。
+  - `collect_weekly_games()` 会在真正抛错前，再对所有未确认 promotion 统一执行一轮最终 reconciliation，尽量把第二单的延迟成功补收回来。
+  - 本地验证限制：未执行测试；已执行 `python3 -m py_compile app/services/epic_games_service.py` 与 `git diff --check` 做静态校验。
