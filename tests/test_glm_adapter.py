@@ -138,6 +138,48 @@ def test_drag_semicolon_answer_preserves_all_paths():
     ]
 
 
+def test_drag_src_tgt_aliases_are_converted_to_path():
+    payload = {"src": [840, 322], "tgt": [640, 470]}
+    text = json.dumps(payload)
+
+    coerced = _coerce_payload_for_schema(
+        _normalize_glm_payload(payload), ImageDragDropChallenge, text
+    )
+    challenge = ImageDragDropChallenge(**coerced)
+
+    assert [path.model_dump() for path in challenge.paths] == [
+        {"start_point": {"x": 840, "y": 322}, "end_point": {"x": 640, "y": 470}}
+    ]
+
+
+def test_drag_src_dest_aliases_are_converted_to_path():
+    payload = {"src": {"x": 830, "y": 322}, "dest": {"x": 533, "y": 446}}
+    text = json.dumps(payload)
+
+    coerced = _coerce_payload_for_schema(
+        _normalize_glm_payload(payload), ImageDragDropChallenge, text
+    )
+    challenge = ImageDragDropChallenge(**coerced)
+
+    assert [path.model_dump() for path in challenge.paths] == [
+        {"start_point": {"x": 830, "y": 322}, "end_point": {"x": 533, "y": 446}}
+    ]
+
+
+def test_drag_pipe_separated_answer_is_converted_to_path():
+    payload = {"answer": "840,322|640,470"}
+    text = json.dumps(payload)
+
+    coerced = _coerce_payload_for_schema(
+        _normalize_glm_payload(payload), ImageDragDropChallenge, text
+    )
+    challenge = ImageDragDropChallenge(**coerced)
+
+    assert [path.model_dump() for path in challenge.paths] == [
+        {"start_point": {"x": 840, "y": 322}, "end_point": {"x": 640, "y": 470}}
+    ]
+
+
 def test_router_answer_single_select_is_converted_to_challenge_type():
     text = '{"answer":"image_label_single_select"}'
 

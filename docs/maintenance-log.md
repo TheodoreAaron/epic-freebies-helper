@@ -799,3 +799,27 @@
   - 登录验证码消失但仍停留密码表单时，会在现有三次 solve 预算内重新提交登录，不增加认证总轮数，也不改变领取复核或 GitHub Actions 30 分钟限制。
   - 默认 GLM 模型与文档统一为 `glm-4.6v`。工作流对 provider 和模型名改为 GitHub Variables 优先、同名 Secrets 兼容回退，并增加有效模型路由日志。模型名迁移到 Variables 后，`SPATIAL_PATH_REASONER_MODEL` 可直接显示；仍放在 Secrets 时继续遵守 GitHub 自动遮罩。
   - 增加多路径四元坐标、分号分隔路径和 `src` 点对回归用例。按仓库规则未执行测试；已通过 Black、Ruff、`py_compile` 和 `git diff --check` 静态验证。
+
+### 2026-07-17 Actions 复杂验证码别名校验失败与密码表单恢复异常
+
+- 现象：
+  - Fork 运行 `29562510108` 使用上一轮修复提交后仍在登录阶段失败；日志证明模型路由和 GLM 补丁已经生效，并且 `image_drag_multi` 已能输出两条路径。
+  - 同一运行中 GLM 还返回了 `src` + `tgt`、`src` + `dest` 和 `answer="840,322|640,470"` 等变体，这些响应在执行拖动前被 `ImageDragDropChallenge.paths` 必填校验拒绝。
+  - hCaptcha 消失后页面实际回到了已填写密码的 `Enter your password` 表单，但恢复逻辑报 `Frame.is_visible() got an unexpected keyword argument 'timeout'`，三轮认证都无法重新提交登录。
+  - 运行时产物路径只有 `app/volumes/runtime/`，而 hCaptcha 挑战原图位于隐藏目录 `app/volumes/hcaptcha/.challenge/`，失败后只能看到密码页截图，无法复核模型对复杂题型的视觉配对。
+- 根因判断：
+  - GLM 返回格式仍存在未覆盖的目标字段别名和坐标分隔符；归一化在 Pydantic 响应模型校验前没有把这些真实返回统一成 `paths`。
+  - Camoufox 使用的 Playwright 兼容层不接受当前 `is_visible(timeout=...)` 调用路径，密码表单恢复分支因此在点击 `Sign in` 之前异常退出。
+  - 复杂拖动提示虽然要求保留多路径，但没有明确强调按题目数量、实心可移动图形与空心轮廓、完整形状和方向逐一配对，模型仍可能按同一行等弱特征选择目标。
+- 改动文件：
+  - `app/extensions/llm_adapter.py`
+  - `app/services/epic_authorization_service.py`
+  - `.github/workflows/epic-gamer.yml`
+  - `tests/test_glm_adapter.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 拖动坐标归一化新增 `src` 对 `tgt` / `dest` / `destination` 等目标别名，并支持 `x,y|x,y`、箭头和冒号分隔的单路径答案；这些变体会在 Pydantic 校验前转换为标准 `start_point` / `end_point`。
+  - 复杂拖动提示要求路径数与题目显式数量一致，先区分实心可移动部件和空心目标轮廓，再按形状、颜色、尺寸和方向匹配，避免仅按行位置配对。
+  - 密码表单恢复改用 `Locator.wait_for(state="visible")`，避免不兼容的 `is_visible(timeout=...)`；重新提交后会先等待登录结果，只有新 hCaptcha 出现时才进入下一次 solve，保留原有三轮预算。
+  - `epic-runtime` 产物同时上传 `.challenge` 隐藏目录，后续失败运行可以直接复核挑战原图和模型缓存；领取多轮复核与 Actions 30 分钟限制均未修改。
+  - 按仓库规则未执行测试；提交前只执行格式化、Ruff、`py_compile`、workflow YAML 解析和 `git diff --check` 静态校验。

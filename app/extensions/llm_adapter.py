@@ -40,6 +40,29 @@ POINTS_ALIASES = ("points", "point", "coordinates", "Coordinates")
 
 PATHS_ALIASES = ("paths", "path", "coordinates", "Coordinates")
 
+DRAG_SOURCE_ALIASES = (
+    "source",
+    "from",
+    "source_coordinates",
+    "source_position",
+    "start",
+    "start_point",
+    "src",
+)
+
+DRAG_TARGET_ALIASES = (
+    "target",
+    "to",
+    "target_coordinates",
+    "target_position",
+    "end",
+    "end_point",
+    "dst",
+    "tgt",
+    "dest",
+    "destination",
+)
+
 GLM_VISUAL_COORDINATE_INSTRUCTION = (
     "For image coordinate challenges, read the gray coordinate grid printed on the image. "
     "Return final JSON coordinates in that printed grid coordinate system, not local image "
@@ -50,11 +73,14 @@ GLM_VISUAL_COORDINATE_INSTRUCTION = (
 GLM_COMPLEX_DRAG_INSTRUCTION = (
     "For drag-path challenges, inspect the full scene before answering and count every movable "
     "piece that must be placed. Return one paths entry per required move and never collapse a "
-    "multi-piece answer into a single path. For line-completion puzzles, follow the numbered "
-    "endpoints in order, match each movable segment by shape, color, and orientation, use the "
-    "center of the movable piece as start_point, and use the center of its intended gap as "
-    "end_point. Output only the response schema fields challenge_prompt and paths; do not use "
-    "aliases such as answer or src."
+    "multi-piece answer into a single path. When the prompt names a count such as TWO, the paths "
+    "array must contain exactly that many moves. Distinguish solid movable pieces from hollow or "
+    "outlined destinations, then pair each piece with its exact matching silhouette by shape, "
+    "color, size, and orientation; do not pair objects merely because they share a row. For "
+    "line-completion puzzles, follow the numbered endpoints in order and match each movable "
+    "segment by shape, color, and orientation. Always use the center of the movable piece as "
+    "start_point and the center of its intended outline or gap as end_point. Output only the "
+    "response schema fields challenge_prompt and paths; do not use aliases such as answer or src."
 )
 
 GLM_MULTI_TARGET_INSTRUCTION = (
@@ -310,16 +336,10 @@ def _extract_drag_points_from_text(text: str) -> tuple[dict[str, int], dict[str,
 
 def _extract_drag_points_from_value(value: Any) -> tuple[dict[str, int], dict[str, int]] | None:
     if isinstance(value, dict):
-        for source_key, target_key in (
-            ("source", "target"),
-            ("from", "to"),
-            ("source_coordinates", "target_coordinates"),
-            ("source_position", "target_position"),
-            ("start", "end"),
-            ("start_point", "end_point"),
-        ):
-            if source_key in value and target_key in value:
-                return _build_drag_points_pair(value.get(source_key), value.get(target_key))
+        drag_paths = _extract_drag_paths_from_value(value)
+        if drag_paths:
+            first_path = drag_paths[0]
+            return first_path["start_point"], first_path["end_point"]
 
         paths_payload = value.get("paths")
         if isinstance(paths_payload, list):
@@ -355,37 +375,32 @@ def _extract_drag_paths_from_value(value: Any) -> list[dict[str, dict[str, int]]
     if isinstance(value, dict):
         paths: list[dict[str, dict[str, int]]] = []
 
-        for source_key, target_key in (
-            ("source", "target"),
-            ("from", "to"),
-            ("source_coordinates", "target_coordinates"),
-            ("source_position", "target_position"),
-            ("start", "end"),
-            ("start_point", "end_point"),
-            ("src", "dst"),
-        ):
-            if source_key not in value or target_key not in value:
+        for source_key in DRAG_SOURCE_ALIASES:
+            if source_key not in value:
                 continue
+            for target_key in DRAG_TARGET_ALIASES:
+                if target_key not in value:
+                    continue
 
-            sources = value.get(source_key)
-            targets = value.get(target_key)
-            if isinstance(sources, list) and isinstance(targets, list):
-                source_points = [_coerce_point(item) for item in sources]
-                target_points = [_coerce_point(item) for item in targets]
-                if (
-                    source_points
-                    and len(source_points) == len(target_points)
-                    and all(source_points)
-                    and all(target_points)
-                ):
-                    return [
-                        {"start_point": source, "end_point": target}
-                        for source, target in zip(source_points, target_points)
-                    ]
+                sources = value.get(source_key)
+                targets = value.get(target_key)
+                if isinstance(sources, list) and isinstance(targets, list):
+                    source_points = [_coerce_point(item) for item in sources]
+                    target_points = [_coerce_point(item) for item in targets]
+                    if (
+                        source_points
+                        and len(source_points) == len(target_points)
+                        and all(source_points)
+                        and all(target_points)
+                    ):
+                        return [
+                            {"start_point": source, "end_point": target}
+                            for source, target in zip(source_points, target_points)
+                        ]
 
-            pair = _build_drag_points_pair(sources, targets)
-            if pair:
-                return [{"start_point": pair[0], "end_point": pair[1]}]
+                pair = _build_drag_points_pair(sources, targets)
+                if pair:
+                    return [{"start_point": pair[0], "end_point": pair[1]}]
 
         for key in ("paths", "path", "coordinates", "Coordinates", "answer", "src"):
             if key not in value:
@@ -439,6 +454,16 @@ def _extract_drag_paths_from_value(value: Any) -> list[dict[str, dict[str, int]]
             paths.append({"start_point": {"x": sx, "y": sy}, "end_point": {"x": tx, "y": ty}})
         if paths:
             return paths
+
+        separated_pair = re.fullmatch(
+            r"\s*\(?\s*(-?\d+)\s*,\s*(-?\d+)\s*\)?\s*"
+            r"(?:\||->|=>|:)\s*"
+            r"\(?\s*(-?\d+)\s*,\s*(-?\d+)\s*\)?\s*",
+            value,
+        )
+        if separated_pair:
+            sx, sy, tx, ty = map(int, separated_pair.groups())
+            return [{"start_point": {"x": sx, "y": sy}, "end_point": {"x": tx, "y": ty}}]
 
         pair = _extract_drag_points_from_text(value)
         if pair:

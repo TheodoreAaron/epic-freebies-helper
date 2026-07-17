@@ -93,7 +93,10 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: epic-runtime-${{ github.run_id }}
-          path: app/volumes/runtime/
+          path: |
+            app/volumes/runtime/
+            app/volumes/hcaptcha/.challenge/
+          include-hidden-files: true
           retention-days: 7
 
       - name: Upload log artifacts
