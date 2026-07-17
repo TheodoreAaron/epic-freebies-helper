@@ -384,6 +384,26 @@ class EpicAuthorization:
         with suppress(Exception):
             await old_page.close()
 
+    async def _resubmit_password_form(self) -> bool:
+        password_input = self.page.locator("#password")
+        sign_in_button = self.page.locator("#sign-in")
+
+        try:
+            if not await password_input.is_visible(timeout=1000):
+                return False
+            if not await sign_in_button.is_visible(timeout=1000):
+                return False
+
+            if not await password_input.input_value(timeout=1000):
+                await password_input.fill(settings.EPIC_PASSWORD.get_secret_value())
+
+            await sign_in_button.click(timeout=5000)
+            await self.page.wait_for_timeout(1000)
+            return True
+        except Exception as err:
+            logger.warning("Could not resubmit Epic password form after captcha reset: {!r}", err)
+            return False
+
     async def _get_login_status(self, timeout_ms: int = 30000) -> str | None:
         if self._needs_privacy_policy_correction():
             return None
@@ -510,13 +530,23 @@ class EpicAuthorization:
                     login_confirmed = True
                     break
                 except PlaywrightTimeoutError:
-                    if not await self._has_visible_hcaptcha():
-                        raise
-                    logger.warning(
-                        "Login outcome timed out while captcha is still visible; retrying solve "
-                        "attempt {}/3",
-                        challenge_attempt,
-                    )
+                    if await self._has_visible_hcaptcha():
+                        logger.warning(
+                            "Login outcome timed out while captcha is still visible; retrying "
+                            "solve attempt {}/3",
+                            challenge_attempt,
+                        )
+                        continue
+
+                    if challenge_attempt < 3 and await self._resubmit_password_form():
+                        logger.warning(
+                            "Login captcha disappeared without authentication; resubmitted the "
+                            "password form before solve attempt {}/3",
+                            challenge_attempt + 1,
+                        )
+                        continue
+
+                    raise
 
             if not login_confirmed:
                 await self._await_login_outcome(point_url, timeout_seconds=10)

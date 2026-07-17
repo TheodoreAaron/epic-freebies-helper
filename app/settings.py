@@ -58,7 +58,7 @@ class EpicSettings(AgentConfig):
         default="https://open.bigmodel.cn/api/paas/v4", description="GLM OpenAI-compatible base URL"
     )
 
-    GLM_MODEL: str = Field(default="glm-4.5v", description="GLM vision-capable default model")
+    GLM_MODEL: str = Field(default="glm-4.6v", description="GLM vision-capable default model")
 
     BROWSER_BACKEND: str = Field(
         default="auto", description="Supported values: auto, camoufox, playwright"

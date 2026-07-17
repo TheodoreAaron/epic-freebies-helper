@@ -468,6 +468,7 @@
   - `README.en.md`
   - `.github/workflows/README.md`
   - `.github/workflows/README.en.md`
+  - `docker/docker-compose.yaml`
   - `docs/maintenance-log.md`
 - 处理结果：
   - 在中英文 README 和 workflow 文档中补充一句直白说明。
@@ -768,3 +769,33 @@
   - 在项目依赖中显式增加 `browserforge>=1.2.4`，避免后续重新锁定到缺少运行时数据文件的版本。
   - 刷新 `uv.lock`，将 `browserforge` 从 `1.2.3` 更新到 `1.2.4`，并锁定新增的 `apify-fingerprint-datapoints` 传递依赖。
   - 本地验证：`from browserforge.headers import HeaderGenerator`、`from browserforge.fingerprints import FingerprintGenerator`、`from camoufox import AsyncCamoufox` 均可正常导入。
+
+### 2026-07-17 GLM 复杂验证码多路径丢失并导致 Epic 登录失败
+
+- 现象：
+  - 同一提交在维护者账号上可以完成登录和领取，但部分 Fork 会在 Epic 登录 hCaptcha 阶段连续失败，三轮认证后以 `Authentication failed, aborting this run` 退出。
+  - 失败日志包含 `ImageDragDropChallenge` 的 `challenge_prompt` / `paths` 缺失校验错误；模型实际返回过 `answer` 四元坐标列表和 `src` 点对。
+  - 失败账号主要收到 `image_drag_multi`、多目标点选和补全线段题；成功账号只收到相对简单的 `image_drag_single`。`/checkcaptcha/` 空响应在成功任务中也会出现，因此不是决定性根因。
+- 根因判断：
+  - GLM 兼容层只稳定归一化单条拖动路径，不能按 `ImageDragDropChallenge` schema 保留 `answer=[[sx,sy,tx,ty], ...]` 中的全部路径，也不兼容 `src` / `dst` 点对。
+  - 模型即使识别了多个可移动部件，结构校验重试也可能把结果收缩成单条合法路径，导致复杂拖动题只执行第一步并被 hCaptcha 拒绝。
+  - 验证码 frame 消失但页面退回已填写的密码表单时，登录逻辑不会重新提交 `Sign in`，会空等登录结果后重建整轮认证。
+  - GitHub Actions 把模型名与 API Key 一起配置为 Secrets，导致有效的 `SPATIAL_PATH_REASONER_MODEL` 在诊断日志中被自动遮罩。
+- 改动文件：
+  - `app/extensions/llm_adapter.py`
+  - `app/services/epic_authorization_service.py`
+  - `app/settings.py`
+  - `app/deploy.py`
+  - `.github/workflows/epic-gamer.yml`
+  - `tests/test_glm_adapter.py`
+  - `README.md`
+  - `README.en.md`
+  - `.github/workflows/README.md`
+  - `.github/workflows/README.en.md`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 拖动题按目标 schema 归一化，兼容标准 `paths`、四元坐标列表、点对、`answer`、`src` / `dst` 等返回形式，并按原顺序保留全部拖动路径。
+  - GLM 视觉提示增加复杂拖动和多目标点选约束：先统计全部可移动部件；补全线段题按编号端点、形状、颜色和方向匹配；每个动作必须输出独立 `paths` 项。
+  - 登录验证码消失但仍停留密码表单时，会在现有三次 solve 预算内重新提交登录，不增加认证总轮数，也不改变领取复核或 GitHub Actions 30 分钟限制。
+  - 默认 GLM 模型与文档统一为 `glm-4.6v`。工作流对 provider 和模型名改为 GitHub Variables 优先、同名 Secrets 兼容回退，并增加有效模型路由日志。模型名迁移到 Variables 后，`SPATIAL_PATH_REASONER_MODEL` 可直接显示；仍放在 Secrets 时继续遵守 GitHub 自动遮罩。
+  - 增加多路径四元坐标、分号分隔路径和 `src` 点对回归用例。按仓库规则未执行测试；已通过 Black、Ruff、`py_compile` 和 `git diff --check` 静态验证。

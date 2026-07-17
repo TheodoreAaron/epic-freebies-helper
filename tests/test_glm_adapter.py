@@ -94,6 +94,50 @@ def test_drag_source_coordinates_are_converted_to_paths():
     assert challenge.paths[0].end_point.model_dump() == {"x": 960, "y": 545}
 
 
+def test_drag_answer_quadruplets_preserve_all_paths():
+    payload = {"answer": [[802, 345, 584, 322], [802, 470, 460, 420]]}
+    text = json.dumps(payload)
+
+    coerced = _coerce_payload_for_schema(
+        _normalize_glm_payload(payload), ImageDragDropChallenge, text
+    )
+    challenge = ImageDragDropChallenge(**coerced)
+
+    assert [path.model_dump() for path in challenge.paths] == [
+        {"start_point": {"x": 802, "y": 345}, "end_point": {"x": 584, "y": 322}},
+        {"start_point": {"x": 802, "y": 470}, "end_point": {"x": 460, "y": 420}},
+    ]
+
+
+def test_drag_src_point_pair_is_converted_to_path():
+    payload = {"src": [{"x": 805, "y": 358}, {"x": 535, "y": 425}]}
+    text = json.dumps(payload)
+
+    coerced = _coerce_payload_for_schema(
+        _normalize_glm_payload(payload), ImageDragDropChallenge, text
+    )
+    challenge = ImageDragDropChallenge(**coerced)
+
+    assert [path.model_dump() for path in challenge.paths] == [
+        {"start_point": {"x": 805, "y": 358}, "end_point": {"x": 535, "y": 425}}
+    ]
+
+
+def test_drag_semicolon_answer_preserves_all_paths():
+    payload = {"answer": "801,345,584,322;801,460,477,421"}
+    text = json.dumps(payload)
+
+    coerced = _coerce_payload_for_schema(
+        _normalize_glm_payload(payload), ImageDragDropChallenge, text
+    )
+    challenge = ImageDragDropChallenge(**coerced)
+
+    assert [path.model_dump() for path in challenge.paths] == [
+        {"start_point": {"x": 801, "y": 345}, "end_point": {"x": 584, "y": 322}},
+        {"start_point": {"x": 801, "y": 460}, "end_point": {"x": 477, "y": 421}},
+    ]
+
+
 def test_router_answer_single_select_is_converted_to_challenge_type():
     text = '{"answer":"image_label_single_select"}'
 
